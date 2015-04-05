@@ -1,12 +1,40 @@
 // Package searpc implements RPC framework for Seafile.
 // It doesn't include transports, only provides function call and encode/decode.
+//
+
+/*
+1. Defining a Service
+
+type MyService struct {
+}
+
+func (s *MyService) Functioin1(a int, b string) *searpc.Result {
+	return nil
+}
+
+func (s *MyService) Function2(a string, b string, c int) *searpc.Result {
+	return nil
+}
+
+2. Registering a Service
+
+svr := searpc.NewServer()
+s := new(MyService)
+svr.Register(s)
+
+3. Calling a Service Function
+
+jsonStr := transport.recv()
+resStr := svr.Call("MyService", jsonStr)
+*/
 package searpc
 
 import (
-	"errors"
 	"encoding/json"
+	"errors"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
@@ -28,11 +56,11 @@ type Server struct {
 
 type Result struct {
 	Ret     interface{} `json:"ret"`
-	ErrCode int         `json:"err_code"`
-	ErrMsg  string      `json:"err_msg"`
+	ErrCode int         `json:"err_code,omitempty"`
+	ErrMsg  string      `json:"err_msg,omitempty"`
 }
 
-var typeOfResult = reflect.TypeOf((*Result)(nil)).Elem()
+var typeOfResult = reflect.TypeOf((*Result)(nil))
 
 // NewServer returns a new Server.
 func NewServer() *Server {
@@ -45,7 +73,7 @@ func isExported(name string) bool {
 	return unicode.IsUpper(rune)
 }
 
-func (server *Server) Register(rcvr interface{}) error {
+func (server *Server) Register(rcvr interface{}, svcName string) error {
 	server.lock.Lock()
 	defer server.lock.Unlock()
 	if server.serviceMap == nil {
@@ -54,16 +82,23 @@ func (server *Server) Register(rcvr interface{}) error {
 	s := new(service)
 	s.typ = reflect.TypeOf(rcvr)
 	s.rcvr = reflect.ValueOf(rcvr)
-	sname := reflect.Indirect(s.rcvr).Type().Name()
-	if sname == "" {
-		s := "searpc.Register: no service name for type " + s.typ.String()
-		log.Print(s)
-		return errors.New(s)
-	}
-	if !isExported(sname) {
-		s := "searpc.Register: type " + sname + " is not exported"
-		log.Print(s)
-		return errors.New(s)
+
+	sname := ""
+	if svcName != "" {
+		sname = svcName
+	} else {
+		sname := reflect.Indirect(s.rcvr).Type().Name()
+		if sname == "" {
+			s := "searpc.Register: no service name for type " + s.typ.String()
+			log.Print(s)
+			return errors.New(s)
+		}
+		if !isExported(sname) {
+			s := "searpc.Register: type " + sname + " is not exported"
+			log.Print(s)
+			return errors.New(s)
+		}
+
 	}
 	if _, present := server.serviceMap[sname]; present {
 		return errors.New("searpc: service already defined: " + sname)
@@ -97,11 +132,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*reflect.Metho
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
 		mtype := method.Type
-		mname := method.Name
-		// Method must be exported.
-		if method.PkgPath != "" {
-			continue
-		}
+		mname := strings.ToLower(method.Name)
 		// Method needs one out.
 		if mtype.NumOut() != 1 {
 			if reportErr {
@@ -109,10 +140,10 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*reflect.Metho
 			}
 			continue
 		}
-		// The return type of the method must be error.
+		// The return type of the method must be Result.
 		if returnType := mtype.Out(0); returnType != typeOfResult {
 			if reportErr {
-				log.Println("method", mname, "returns", returnType.String(), "not error")
+				log.Println("method", mname, "returns", returnType.String(), "not Result")
 			}
 			continue
 		}
@@ -131,14 +162,14 @@ const (
 )
 
 func (server *Server) Call(serviceName string, callStr []byte) (retStr []byte) {
-	var res Result
+	var res *Result
 	var errStr string
 	var errCode int
 
 	service := server.serviceMap[serviceName]
 	if service == nil {
-		res = Result{ErrCode: ServiceNotFoundError, ErrMsg: "Cannot find service " + serviceName}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: ServiceNotFoundError, ErrMsg: "Cannot find service " + serviceName}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
 
@@ -148,8 +179,8 @@ func (server *Server) Call(serviceName string, callStr []byte) (retStr []byte) {
 		errStr = "Failed to parse call string:" + parseErr.Error()
 		errCode = ParseJSONError
 		log.Println(errStr)
-		res = Result{ErrCode: errCode, ErrMsg: errStr}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: errCode, ErrMsg: errStr}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
 
@@ -158,8 +189,8 @@ func (server *Server) Call(serviceName string, callStr []byte) (retStr []byte) {
 		errStr = "Invalid call string format"
 		errCode = ParseJSONError
 		log.Println(errStr)
-		res = Result{ErrCode: errCode, ErrMsg: errStr}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: errCode, ErrMsg: errStr}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
 
@@ -168,28 +199,30 @@ func (server *Server) Call(serviceName string, callStr []byte) (retStr []byte) {
 		errStr = "Invalid call string format"
 		errCode = ParseJSONError
 		log.Println(errStr)
-		res = Result{ErrCode: errCode, ErrMsg: errStr}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: errCode, ErrMsg: errStr}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
+	funcName = strings.ToLower(funcName)
 
 	method := service.method[funcName]
 	if method == nil {
 		errStr = "Cannot find function " + funcName
 		errCode = FunctionNotFoundError
 		log.Println(errStr)
-		res = Result{ErrCode: errCode, ErrMsg: errStr}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: errCode, ErrMsg: errStr}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
 
 	mtype := method.Type
-	if mtype.NumIn() != len(array)-1 {
+	// mtype.NumIn() includes the object itself
+	if mtype.NumIn() != len(array) {
 		errStr = "Parameters mismatch"
 		errCode = ParameterError
 		log.Println(errStr)
-		res = Result{ErrCode: errCode, ErrMsg: errStr}
-		retStr, _ = json.Marshal(res)
+		res = &Result{ErrCode: errCode, ErrMsg: errStr}
+		retStr, _ = json.Marshal(*res)
 		return
 	}
 
@@ -198,8 +231,8 @@ func (server *Server) Call(serviceName string, callStr []byte) (retStr []byte) {
 		params = append(params, reflect.ValueOf(array[i]))
 	}
 	errValue := method.Func.Call(params)
-	res = errValue[0].Interface().(Result)
+	res = errValue[0].Interface().(*Result)
 
-	retStr, _ = json.Marshal(res)
+	retStr, _ = json.Marshal(*res)
 	return
 }
